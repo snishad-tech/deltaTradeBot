@@ -23,34 +23,28 @@ except ImportError:
 API_KEY = '3ydb5HyHDxEDSlPCTqEbIhwiJ9CT2y'
 API_SECRET = 'vguUyYXD36zbUO688cBM0ncovU1yPa2kGDTxa5F0CDYiEhS1mbGgkYPN2zm0'
 BASE_URL = 'https://cdn-ind.testnet.deltaex.org'
-SYMBOLS = ['BTCUSD', 'ETHUSD', 'SOLUSD', 'ADAUSD', 'SHIBUSD']
+SYMBOLS = ['BTCUSD', 'ETHUSD', 'SOLUSD']  # High-volume pairs as specified
 SYMBOL_TO_PRODUCT_ID = {}
-LEVERAGE = 100
+LEVERAGE = 5  # 2x-5x leverage as specified
 
 # --- STRATEGY PARAMETERS ---
-TIMEFRAME = '5m'  # Configurable timeframe for strategy (e.g., '1m', '5m', '15m', '1h', '4h')
+ENTRY_TIMEFRAME = '15m'  # Timeframe for entry signals
+TREND_TIMEFRAME = '1h'   # Timeframe for trend confirmation
 RSI_PERIOD = 14
-RSI_OVERSOLD = 30
-RSI_OVERBOUGHT = 70
+RSI_NEUTRAL = 50  # RSI above 50 for long, below 50 for short
+EMA_FAST = 50     # Fast EMA period
+EMA_SLOW = 200    # Slow EMA period
+ATR_PERIOD = 14   # ATR period for stop-loss calculation
+ATR_MULTIPLIER_SL = 1.5  # ATR multiplier for stop-loss
+ATR_MULTIPLIER_TP = 3.0  # ATR multiplier for take-profit (1:3 RR)
+VOLUME_SURGE_MULTIPLIER = 1.5  # Volume must be 1.5x above 20-period average
+VOLUME_PERIOD = 20  # Period for volume average calculation
 
-RISK_PER_TRADE = 0.3  # Fraction of balance to risk per trade (e.g., 0.3 = 30%)
-MAX_TRADES_PER_DAY = 450
+RISK_PER_TRADE = 0.02  # 1-2% of account per trade
+MAX_TRADES_PER_DAY = 4  # 1-4 trades per day
 
 # --- RISK/REWARD CONTROL ---
-STOP_LOSS_PCT = 0.01  # Default 1% stop-loss
-SYMBOL_STOP_LOSS_PCT = {
-    'ETHUSD': 0.03,  # 3% stop-loss for ETHUSD due to volatility
-    'SHIBUSD': 0.05, # 5% stop-loss for SHIBUSD due to high volatility
-    'ADAUSD': 0.02   # 2% stop-loss for ADAUSD
-}
-RISK_REWARD_RATIO = 3.0  # 1:4 risk-reward ratio
 MAX_STOPLOSS_DOLLARS = 35  # Absolute max $ loss per trade
-
-# Calculate TAKE_PROFIT_PCT for each symbol based on stop-loss
-TAKE_PROFIT_PCT = {}
-for symbol in SYMBOLS:
-    sl_pct = SYMBOL_STOP_LOSS_PCT.get(symbol, STOP_LOSS_PCT)
-    TAKE_PROFIT_PCT[symbol] = sl_pct * RISK_REWARD_RATIO
 
 # --- TRAILING LOGIC ---
 TRAILING_ENABLED = True  # Enable trailing stop
@@ -258,7 +252,7 @@ async def set_leverage(symbol, leverage: int) -> bool:
         logger.error(f"Error setting leverage for {symbol}: {str(e)}")
         return False
 
-async def fetch_ohlcv(symbol, resolution=TIMEFRAME, limit=100) -> List[dict]:
+async def fetch_ohlcv(symbol, resolution=ENTRY_TIMEFRAME, limit=100) -> List[dict]:
     try:
         end = int(time.time())
         seconds_per_candle = {'1m': 60, '5m': 300, '15m': 900, '1h': 3600, '4h': 14400}
@@ -328,29 +322,135 @@ def calculate_rsi(closes: list, period: int) -> list:
         rsi.append(100 - (100 / (1 + rs)))
     return rsi
 
+def calculate_ema(closes: list, period: int) -> list:
+    if len(closes) < period:
+        return [closes[-1]] * len(closes) if closes else []
+    
+    ema = []
+    multiplier = 2 / (period + 1)
+    
+    sma = sum(closes[:period]) / period
+    ema.append(sma)
+    
+    for i in range(1, len(closes)):
+        if i < period:
+            ema.append(closes[i])
+        else:
+            ema_value = (closes[i] * multiplier) + (ema[i-1] * (1 - multiplier))
+            ema.append(ema_value)
+    
+    return ema
+
+def calculate_atr(ohlcv: list, period: int) -> list:
+    if len(ohlcv) < 2:
+        return [0] * len(ohlcv)
+    
+    true_ranges = []
+    for i in range(1, len(ohlcv)):
+        high = ohlcv[i]['high']
+        low = ohlcv[i]['low']
+        prev_close = ohlcv[i-1]['close']
+        
+        tr1 = high - low
+        tr2 = abs(high - prev_close)
+        tr3 = abs(low - prev_close)
+        true_range = max(tr1, tr2, tr3)
+        true_ranges.append(true_range)
+    
+    atr = []
+    for i in range(len(ohlcv)):
+        if i == 0:
+            atr.append(0)
+        elif i < period:
+            atr.append(sum(true_ranges[:i]) / i if i > 0 else 0)
+        else:
+            atr.append(sum(true_ranges[i-period:i]) / period)
+    
+    return atr
+
+def calculate_volume_surge(volumes: list, period: int = VOLUME_PERIOD) -> bool:
+    if len(volumes) < period + 1:
+        return False
+    
+    current_volume = volumes[-1]
+    avg_volume = sum(volumes[-period-1:-1]) / period
+    
+    return current_volume >= (avg_volume * VOLUME_SURGE_MULTIPLIER)
+
 # --- STRATEGY LOGIC ---
-async def get_trade_signal(symbol, ohlcv):
-    if not ohlcv:
-        logger.info(f"{symbol}: No OHLCV data available for signal generation")
+async def check_trend_confirmation(symbol: str) -> dict:
+    try:
+        ohlcv_1h = await fetch_ohlcv(symbol, resolution=TREND_TIMEFRAME, limit=EMA_SLOW + 10)
+        if len(ohlcv_1h) < EMA_SLOW:
+            logger.warning(f"{symbol}: Insufficient 1H data for trend confirmation (need {EMA_SLOW}, got {len(ohlcv_1h)})")
+            return {'trend': 'neutral', 'ema_50': None, 'ema_200': None}
+        
+        closes_1h = [c['close'] for c in ohlcv_1h]
+        ema_50 = calculate_ema(closes_1h, EMA_FAST)
+        ema_200 = calculate_ema(closes_1h, EMA_SLOW)
+        
+        current_ema_50 = ema_50[-1]
+        current_ema_200 = ema_200[-1]
+        
+        if current_ema_50 > current_ema_200:
+            trend = 'bullish'
+        elif current_ema_50 < current_ema_200:
+            trend = 'bearish'
+        else:
+            trend = 'neutral'
+        
+        logger.info(f"{symbol}: 1H Trend={trend}, EMA50={current_ema_50:.2f}, EMA200={current_ema_200:.2f}")
+        
+        return {
+            'trend': trend,
+            'ema_50': current_ema_50,
+            'ema_200': current_ema_200
+        }
+        
+    except Exception as e:
+        logger.error(f"{symbol}: Error in trend confirmation: {str(e)}")
+        return {'trend': 'neutral', 'ema_50': None, 'ema_200': None}
+
+async def get_trade_signal(symbol, ohlcv_15m):
+    if not ohlcv_15m or len(ohlcv_15m) < max(RSI_PERIOD, EMA_FAST) + 1:
+        logger.info(f"{symbol}: Insufficient 15m data for signal generation")
         return None
 
-    closes = [c['close'] for c in ohlcv]
-    i = len(closes) - 1
-    min_candles = RSI_PERIOD + 1
-    if i < min_candles:
-        logger.info(f"{symbol}: Not enough candles for signal (have {i+1}, need {min_candles})")
+    trend_data = await check_trend_confirmation(symbol)
+    trend = trend_data['trend']
+    
+    if trend == 'neutral':
+        logger.info(f"{symbol}: Neutral trend, no trades allowed")
         return None
 
-    if closes[i] <= 0:
-        logger.error(f"{symbol}: Invalid close price {closes[i]} at index {i}")
+    closes_15m = [c['close'] for c in ohlcv_15m]
+    volumes_15m = [c['volume'] for c in ohlcv_15m]
+    
+    rsi = calculate_rsi(closes_15m, RSI_PERIOD)
+    if not rsi or len(rsi) != len(closes_15m):
+        logger.error(f"{symbol}: RSI calculation failed")
         return None
-
-    rsi = calculate_rsi(closes, RSI_PERIOD)
-    if not rsi or len(rsi) != len(closes):
-        logger.error(f"{symbol}: RSI calculation failed, length mismatch (closes={len(closes)}, rsi={len(rsi)})")
+    
+    ema_50_15m = calculate_ema(closes_15m, EMA_FAST)
+    if not ema_50_15m:
+        logger.error(f"{symbol}: EMA calculation failed")
         return None
-
-    # --- Initialize static attributes for tracking trades ---
+    
+    atr = calculate_atr(ohlcv_15m, ATR_PERIOD)
+    if not atr:
+        logger.error(f"{symbol}: ATR calculation failed")
+        return None
+    
+    volume_surge = calculate_volume_surge(volumes_15m, VOLUME_PERIOD)
+    if not volume_surge:
+        logger.info(f"{symbol}: No volume surge detected, skipping trade")
+        return None
+    
+    current_price = closes_15m[-1]
+    current_rsi = rsi[-1]
+    current_ema_50 = ema_50_15m[-1]
+    current_atr = atr[-1]
+    
     if not hasattr(get_trade_signal, "last_trade_dir"):
         get_trade_signal.last_trade_dir = {}
     if not hasattr(get_trade_signal, "last_trade_time"):
@@ -358,53 +458,57 @@ async def get_trade_signal(symbol, ohlcv):
 
     last_dir = get_trade_signal.last_trade_dir.get(symbol)
     last_time = get_trade_signal.last_trade_time.get(symbol, 0)
+    current_time = len(closes_15m) - 1
     min_reversal_wait = 3
 
-    # RSI Strategy: Long when RSI crosses above oversold, short when RSI crosses below overbought
-    rsi_crossover_oversold = i > 0 and rsi[i-1] <= RSI_OVERSOLD and rsi[i] > RSI_OVERSOLD
-    rsi_crossunder_overbought = i > 0 and rsi[i-1] >= RSI_OVERBOUGHT and rsi[i] < RSI_OVERBOUGHT
+    price_near_ema = abs(current_price - current_ema_50) / current_price <= 0.02
+    
+    bullish_trend = trend == 'bullish'
+    bullish_pullback = price_near_ema and current_price >= current_ema_50
+    bullish_rsi = current_rsi > RSI_NEUTRAL and current_rsi < 80
+    bullish_candle = len(ohlcv_15m) >= 2 and ohlcv_15m[-1]['close'] > ohlcv_15m[-1]['open']
+    
+    allow_long = (bullish_trend and bullish_pullback and bullish_rsi and 
+                 bullish_candle and volume_surge and 
+                 (last_dir != 'long' or current_time - last_time >= min_reversal_wait))
+    
+    bearish_trend = trend == 'bearish'
+    bearish_pullback = price_near_ema and current_price <= current_ema_50
+    bearish_rsi = current_rsi < RSI_NEUTRAL and current_rsi > 20
+    bearish_candle = len(ohlcv_15m) >= 2 and ohlcv_15m[-1]['close'] < ohlcv_15m[-1]['open']
+    
+    allow_short = (bearish_trend and bearish_pullback and bearish_rsi and 
+                  bearish_candle and volume_surge and 
+                  (last_dir != 'short' or current_time - last_time >= min_reversal_wait))
 
-    allow_long = rsi_crossover_oversold and (last_dir != 'long' or i - last_time >= min_reversal_wait)
-    allow_short = rsi_crossunder_overbought and (last_dir != 'short' or i - last_time >= min_reversal_wait)
-
-    # Log the trade signal conditions with colors
-    color_long = Fore.GREEN if allow_long else Fore.RESET
-    color_short = Fore.RED if allow_short else Fore.RESET
     logger.info(
-        f"{symbol}: RSI[{i-1}]={rsi[i-1]:.2f}, RSI[{i}]={rsi[i]:.2f}, "
-        f"{color_long}Long Signal={allow_long}{Style.RESET_ALL}, "
-        f"{color_short}Short Signal={allow_short}{Style.RESET_ALL}"
+        f"{symbol}: Trend={trend}, Price={current_price:.2f}, EMA50={current_ema_50:.2f}, "
+        f"RSI={current_rsi:.2f}, Volume_Surge={volume_surge}, "
+        f"Long_Signal={allow_long}, Short_Signal={allow_short}"
     )
 
-    # Log whether conditions are fulfilled
     if allow_long:
-        logger.info(f"{Fore.GREEN}{symbol}: Long condition fulfilled (RSI crossed above {RSI_OVERSOLD}){Style.RESET_ALL}")
-    elif allow_short:
-        logger.info(f"{Fore.RED}{symbol}: Short condition fulfilled (RSI crossed below {RSI_OVERBOUGHT}){Style.RESET_ALL}")
-    else:
-        logger.info(f"{symbol}: No trade conditions fulfilled (RSI={rsi[i]:.2f})")
-
-    # --- Risk/Reward: 1:5 ratio with percentage-based SL and TP ---
-    stop_loss_pct = SYMBOL_STOP_LOSS_PCT.get(symbol, STOP_LOSS_PCT)
-    take_profit_pct = TAKE_PROFIT_PCT[symbol]
-
-    if allow_long:
-        entry = closes[i]
-        stop_loss = entry * (1 - stop_loss_pct)
-        take_profit = entry * (1 + take_profit_pct)
+        entry = current_price
+        stop_loss = entry - (current_atr * ATR_MULTIPLIER_SL)
+        take_profit = entry + (current_atr * ATR_MULTIPLIER_TP)
         max_loss = entry - stop_loss
+        
         if not all(np.isfinite([entry, stop_loss, take_profit, max_loss])):
-            logger.error(f"{symbol}: Invalid signal values: entry={entry}, stop_loss={stop_loss}, take_profit={take_profit}, max_loss={max_loss}")
+            logger.error(f"{symbol}: Invalid long signal values")
             return None
-        # Verify RRR for long
+        
         risk = entry - stop_loss
         reward = take_profit - entry
         actual_rrr = reward / risk if risk != 0 else 0
+        
         logger.info(
-            f"{Fore.GREEN}{symbol}: Long signal generated (entry={entry:.8f}, stop_loss={stop_loss:.8f}, take_profit={take_profit:.8f}, RRR={actual_rrr:.2f}){Style.RESET_ALL}"
+            f"{Fore.GREEN}{symbol}: Long signal - Entry={entry:.2f}, SL={stop_loss:.2f}, "
+            f"TP={take_profit:.2f}, RRR={actual_rrr:.2f}, ATR={current_atr:.2f}"
         )
+        
         get_trade_signal.last_trade_dir[symbol] = 'long'
-        get_trade_signal.last_trade_time[symbol] = i
+        get_trade_signal.last_trade_time[symbol] = current_time
+        
         return {
             'side': 'buy',
             'entry': entry,
@@ -412,23 +516,29 @@ async def get_trade_signal(symbol, ohlcv):
             'take_profit': take_profit,
             'max_loss': max_loss
         }
+        
     elif allow_short:
-        entry = closes[i]
-        stop_loss = entry * (1 + stop_loss_pct)
-        take_profit = entry * (1 - take_profit_pct)
+        entry = current_price
+        stop_loss = entry + (current_atr * ATR_MULTIPLIER_SL)
+        take_profit = entry - (current_atr * ATR_MULTIPLIER_TP)
         max_loss = stop_loss - entry
+        
         if not all(np.isfinite([entry, stop_loss, take_profit, max_loss])):
-            logger.error(f"{symbol}: Invalid signal values: entry={entry}, stop_loss={stop_loss}, take_profit={take_profit}, max_loss={max_loss}")
+            logger.error(f"{symbol}: Invalid short signal values")
             return None
-        # Verify RRR for short
+        
         risk = stop_loss - entry
         reward = entry - take_profit
         actual_rrr = reward / risk if risk != 0 else 0
+        
         logger.info(
-            f"{Fore.RED}{symbol}: Short signal generated (entry={entry:.8f}, stop_loss={stop_loss:.8f}, take_profit={take_profit:.8f}, RRR={actual_rrr:.2f}){Style.RESET_ALL}"
+            f"{Fore.RED}{symbol}: Short signal - Entry={entry:.2f}, SL={stop_loss:.2f}, "
+            f"TP={take_profit:.2f}, RRR={actual_rrr:.2f}, ATR={current_atr:.2f}"
         )
+        
         get_trade_signal.last_trade_dir[symbol] = 'short'
-        get_trade_signal.last_trade_time[symbol] = i
+        get_trade_signal.last_trade_time[symbol] = current_time
+        
         return {
             'side': 'sell',
             'entry': entry,
@@ -437,7 +547,7 @@ async def get_trade_signal(symbol, ohlcv):
             'max_loss': max_loss
         }
 
-    logger.info(f"{symbol}: No trade signal generated.")
+    logger.info(f"{symbol}: No trade signal generated")
     return None
 
 # --- ORDER MANAGEMENT ---
@@ -694,47 +804,50 @@ async def trading_loop():
         entry = position.get('entry_price')
         side = position.get('side')
 
-        # Defensive: If stop_loss or take_profit is None, recalculate using percentages
         if stop_loss is None or take_profit is None or entry is None:
-            stop_loss_pct = SYMBOL_STOP_LOSS_PCT.get(symbol, STOP_LOSS_PCT)
-            take_profit_pct = TAKE_PROFIT_PCT[symbol]
-            ohlcv = await fetch_ohlcv(symbol, resolution=TIMEFRAME, limit=50)
-            if not ohlcv or len(ohlcv) < 20:
+            ohlcv = await fetch_ohlcv(symbol, resolution=ENTRY_TIMEFRAME, limit=50)
+            if not ohlcv or len(ohlcv) < ATR_PERIOD:
                 logger.info(f"{symbol}: Not enough OHLCV data to calculate SL/TP for running position.")
                 return
             closes = [float(c['close']) for c in ohlcv if isinstance(c, dict) and 'close' in c]
             current_price = closes[-1]
+            atr = calculate_atr(ohlcv, ATR_PERIOD)
+            current_atr = atr[-1] if atr else 0.01
             if side == 'long':
-                stop_loss = current_price * (1 - stop_loss_pct)
-                take_profit = current_price * (1 + take_profit_pct)
+                stop_loss = current_price - (current_atr * ATR_MULTIPLIER_SL)
+                take_profit = current_price + (current_atr * ATR_MULTIPLIER_TP)
             else:
-                stop_loss = current_price * (1 + stop_loss_pct)
-                take_profit = current_price * (1 - take_profit_pct)
+                stop_loss = current_price + (current_atr * ATR_MULTIPLIER_SL)
+                take_profit = current_price - (current_atr * ATR_MULTIPLIER_TP)
             trade['stop_loss'] = stop_loss
             trade['take_profit'] = take_profit
             logger.info(f"{symbol}: Recalculated SL/TP for running trade: SL={stop_loss:.8f}, TP={take_profit:.8f}")
         else:
-            ohlcv = await fetch_ohlcv(symbol, resolution=TIMEFRAME, limit=50)
+            ohlcv = await fetch_ohlcv(symbol, resolution=ENTRY_TIMEFRAME, limit=50)
             if not ohlcv or len(ohlcv) < 20:
                 logger.info(f"{symbol}: Not enough OHLCV data to manage SL/TP for running position.")
                 return
             closes = [float(c['close']) for c in ohlcv if isinstance(c, dict) and 'close' in c]
             current_price = closes[-1]
 
-        # --- Trailing Stop: Move stop_loss if profit exceeds threshold ---
         if TRAILING_ENABLED and stop_loss is not None and take_profit is not None and entry is not None:
             profit = (current_price - entry) if side == 'long' else (entry - current_price)
-            if profit >= entry * TRAILING_START_PCT:
-                if side == 'long':
-                    new_sl = current_price * (1 - TRAILING_STEP_PCT)
-                    if new_sl > stop_loss:
-                        trade['stop_loss'] = new_sl
-                        logger.info(f"{symbol}: Trailing SL updated for long: New SL={new_sl:.8f}")
-                else:
-                    new_sl = current_price * (1 + TRAILING_STEP_PCT)
-                    if new_sl < stop_loss:
-                        trade['stop_loss'] = new_sl
-                        logger.info(f"{symbol}: Trailing SL updated for short: New SL={new_sl:.8f}")
+            risk = abs(entry - stop_loss)
+            if profit >= risk:
+                atr_data = await fetch_ohlcv(symbol, resolution=ENTRY_TIMEFRAME, limit=ATR_PERIOD + 5)
+                if atr_data and len(atr_data) >= ATR_PERIOD:
+                    atr = calculate_atr(atr_data, ATR_PERIOD)
+                    current_atr = atr[-1] if atr else 0.01
+                    if side == 'long':
+                        new_sl = current_price - current_atr
+                        if new_sl > stop_loss:
+                            trade['stop_loss'] = new_sl
+                            logger.info(f"{symbol}: Trailing SL updated for long: New SL={new_sl:.8f}")
+                    else:
+                        new_sl = current_price + current_atr
+                        if new_sl < stop_loss:
+                            trade['stop_loss'] = new_sl
+                            logger.info(f"{symbol}: Trailing SL updated for short: New SL={new_sl:.8f}")
 
         # --- SL/TP execution logic ---
         stop_loss = trade.get('stop_loss')
@@ -746,23 +859,23 @@ async def trading_loop():
         # Close position if price crosses SL or TP
         if side == 'long':
             if current_price <= stop_loss:
-                logger.info(f"{Fore.RED}{symbol}: Stop-Loss hit at {current_price:.8f} for long position. Closing position with market order.{Style.RESET_ALL}")
+                logger.info(f"{Fore.RED}{symbol}: Stop-Loss hit at {current_price:.8f} for long position. Closing position with market order.")
                 if await close_position(symbol, position):
                     running_trades[symbol].remove(trade)
                     await cancel_pending_orders(symbol)
             elif current_price >= take_profit:
-                logger.info(f"{Fore.GREEN}{symbol}: Take-Profit hit at {current_price:.8f} for long position. Closing position with market order.{Style.RESET_ALL}")
+                logger.info(f"{Fore.GREEN}{symbol}: Take-Profit hit at {current_price:.8f} for long position. Closing position with market order.")
                 if await close_position(symbol, position):
                     running_trades[symbol].remove(trade)
                     await cancel_pending_orders(symbol)
         else:
             if current_price >= stop_loss:
-                logger.info(f"{Fore.RED}{symbol}: Stop-Loss hit at {current_price:.8f} for short position. Closing position with market order.{Style.RESET_ALL}")
+                logger.info(f"{Fore.RED}{symbol}: Stop-Loss hit at {current_price:.8f} for short position. Closing position with market order.")
                 if await close_position(symbol, position):
                     running_trades[symbol].remove(trade)
                     await cancel_pending_orders(symbol)
             elif current_price <= take_profit:
-                logger.info(f"{Fore.GREEN}{symbol}: Take-Profit hit at {current_price:.8f} for short position. Closing position with market order.{Style.RESET_ALL}")
+                logger.info(f"{Fore.GREEN}{symbol}: Take-Profit hit at {current_price:.8f} for short position. Closing position with market order.")
                 if await close_position(symbol, position):
                     running_trades[symbol].remove(trade)
                     await cancel_pending_orders(symbol)
@@ -828,9 +941,9 @@ async def trading_loop():
                     logger.info(f"{symbol}: Max daily trades ({MAX_TRADES_PER_DAY}) reached")
                     continue
 
-                ohlcv = await fetch_ohlcv(symbol, resolution=TIMEFRAME, limit=100)
-                if len(ohlcv) < RSI_PERIOD + 1:
-                    logger.warning(f"{symbol}: Insufficient OHLCV data (fetched {len(ohlcv)} candles, need {RSI_PERIOD + 1})")
+                ohlcv = await fetch_ohlcv(symbol, resolution=ENTRY_TIMEFRAME, limit=max(RSI_PERIOD, EMA_SLOW) + 10)
+                if len(ohlcv) < max(RSI_PERIOD, EMA_FAST) + 1:
+                    logger.warning(f"{symbol}: Insufficient 15m OHLCV data (fetched {len(ohlcv)} candles, need {max(RSI_PERIOD, EMA_FAST) + 1})")
                     continue
 
                 signal = await get_trade_signal(symbol, ohlcv)
@@ -892,7 +1005,7 @@ async def trading_loop():
                     daily_trades[symbol] += 1
                     color = Fore.GREEN if signal['side'] == 'buy' else Fore.RED
                     logger.info(
-                        f"{color}{symbol}: New {signal['side']} trade opened: Entry={entry:.8f}, SL={sl:.8f}, TP={tp:.8f}, Scalping={signal.get('is_scalping', False)}{Style.RESET_ALL}"
+                        f"{color}{symbol}: New {signal['side']} trade opened: Entry={entry:.8f}, SL={sl:.8f}, TP={tp:.8f}, Scalping={signal.get('is_scalping', False)}"
                     )
 
         except Exception as e:
